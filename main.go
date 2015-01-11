@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,6 +19,37 @@ type Config struct {
 }
 
 var c = &Config{}
+
+const (
+	stateInit = iota + 1
+	stateThread
+	stateMessage
+	stateMessageHeader
+	stateUser
+	stateMeta
+	stateMessageP
+)
+
+var state = stateInit
+var level = 0
+var skipAtom = atom.Atom(0)
+var skipAttrKey = ""
+var skipAttrValue = ""
+var postSkipFunc = (func())(nil)
+
+type Message struct {
+	From string
+	Date time.Time
+	P    string
+}
+
+type Thread struct {
+	Participants string
+	Date         time.Time
+	Messages     []*Message
+}
+
+type Threads []*Thread
 
 func init() {
 	flag.StringVar(&c.Person, "person", "", "Friend's name")
@@ -45,79 +77,44 @@ func main() {
 	}
 	reader := bufio.NewReader(file)
 
-	err = filter(c, reader)
+	threads, err := filter(c, reader)
 	if err != nil {
 		return
 	}
+
+	threads.Print(os.Stdout)
 }
 
-func filter(c *Config, reader io.Reader) error {
+func filter(c *Config, reader io.Reader) (threads Threads, err error) {
 	z := html.NewTokenizer(reader)
-
+	ts := Threads(make([]*Thread, 0, 8))
 	for {
-		err := filterOne(c, reader, z)
+		var err error
+		ts, err = filterOne(c, reader, z, ts)
+
 		switch err {
 		case nil:
-			// do nothing
+			threads = ts
 		case io.EOF:
-			return nil
+			return threads, nil
 		default:
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return threads, nil
 }
 
-func hasAttr(t html.Token, key, val string) bool {
-	if key == "" || val == "" {
-		return true
-	}
-	for _, a := range t.Attr {
-		if a.Key == key && a.Val == val {
-			return true
-		}
-	}
-	return false
-}
+func filterOne(
+	c *Config, reader io.Reader, z *html.Tokenizer, threads Threads) (
+	threadsOut Threads, err error) {
 
-func skipTo(a atom.Atom, class string, newState int) {
-	state = stateSkipToElement
-	skipAtom = a
-	skipAttrKey = "class"
-	skipAttrValue = class
-	postSkipState = newState
-}
-
-const (
-	stateInit = iota + 1
-	stateSkipToElement
-	stateThread
-	stateMessage
-	stateMessageHeader
-	stateUser
-	stateMeta
-	stateMessageP
-)
-
-var state = stateInit
-var level = 0
-var skipAtom = atom.Atom(0)
-var skipAttrKey = ""
-var skipAttrValue = ""
-var postSkipState = 0
-var threadParticipants = ""
-var messageFrom = ""
-var messageDate = time.Time{}
-var messageP = ""
-
-func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 	tt := z.Next()
 	token := html.Token{}
 
 	switch tt {
 	case html.ErrorToken:
-		return z.Err()
+		return nil, z.Err()
 
 	case html.StartTagToken:
 		token = z.Token()
@@ -130,42 +127,37 @@ func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 	// log.Printf("filterOne: %v %v:%v", level, tt, token)
 
 	switch state {
-	case stateSkipToElement:
+	case stateInit:
 		switch {
-		case tt != html.StartTagToken:
-			log.Printf("%v: Skipping %v", state, tt)
-		case skipAtom != token.DataAtom:
-			log.Printf("%v: Skipping %v", state, token.DataAtom)
-		case !hasAttr(token, skipAttrKey, skipAttrValue):
-			log.Printf("%v: Skipping %v, didn't match %q=%q",
-				state, token.DataAtom,
-				skipAttrKey, skipAttrValue)
+		case tt == html.StartTagToken &&
+			token.DataAtom == atom.Div &&
+			hasAttr(token, "class", "thread"):
+
+			state = stateThread
+
 		default:
-			state = postSkipState
-			skipAtom = 0
-			skipAttrKey = ""
-			skipAttrValue = ""
-			postSkipState = 0
+			// skip
 		}
 
-	case stateInit:
-		skipTo(atom.Div, "thread", stateThread)
-
 	case stateThread:
+		// len(threads) must be >0
 		switch {
 		case tt == html.EndTagToken:
-			log.Printf("%v: End thread %q", state, threadParticipants)
-			skipTo(atom.Div, "thread", stateThread)
+			log.Printf("%v: End thread", state)
+			state = stateInit
 
 		case tt == html.TextToken:
 			participants := string(z.Text())
 			if strings.Contains(participants, c.Person) {
 				log.Printf("%v: Begin thread %q", state, participants)
-				threadParticipants = participants
-				skipTo(atom.Div, "message", stateMessage)
+				t := &Thread{
+					Date:         time.Now(),
+					Participants: participants,
+				}
+				threads = append(threads, t)
 			} else {
 				log.Printf("%v: Skipping thread %q", state, participants)
-				skipTo(atom.Div, "thread", stateThread)
+				state = stateInit
 			}
 
 		case tt == html.StartTagToken &&
@@ -173,17 +165,18 @@ func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 			hasAttr(token, "class", "message"):
 
 			log.Printf("%v: Message", state)
+			t := threads[len(threads)-1]
+			t.Messages = append(t.Messages, &Message{})
 			state = stateMessage
 
 		case tt == html.StartTagToken &&
 			token.DataAtom == atom.P:
 
 			log.Printf("%v: Message P", state)
-			messageP = ""
 			state = stateMessageP
 
 		default:
-			return fmt.Errorf("%v: Unexpected %#v", state, token)
+			return nil, fmt.Errorf("%v: Unexpected %#v", state, token)
 		}
 
 	case stateMessage:
@@ -195,13 +188,11 @@ func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 		case token.DataAtom == atom.Div &&
 			hasAttr(token, "class", "message_header"):
 
-			messageFrom = ""
-			messageDate = time.Time{}
 			log.Printf("%v: Message header", state)
 			state = stateMessageHeader
 
 		default:
-			return fmt.Errorf("%v: Unexpected %#v", state, token)
+			return nil, fmt.Errorf("%v: Unexpected %#v", state, token)
 		}
 
 	case stateMessageHeader:
@@ -223,22 +214,26 @@ func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 			state = stateMeta
 
 		default:
-			return fmt.Errorf("%v: Unexpected %+v", state, token)
+			return nil, fmt.Errorf("%v: Unexpected %+v", state, token)
 		}
 
 	case stateUser:
+		t := threads[len(threads)-1]
+		m := t.Messages[len(t.Messages)-1]
 		switch {
 		case tt == html.EndTagToken:
 			log.Printf("%v: End user", state)
 			state = stateMessageHeader
 
 		default:
-			messageFrom = string(z.Text())
-			messageFrom = strings.Split(messageFrom, " ")[0]
-			log.Printf("%v: User %q", state, messageFrom)
+			m.From = string(z.Text())
+			m.From = strings.Split(m.From, " ")[0]
+			log.Printf("%v: User %q", state, m.From)
 		}
 
 	case stateMeta:
+		t := threads[len(threads)-1]
+		m := t.Messages[len(t.Messages)-1]
 		switch {
 		case tt == html.EndTagToken:
 			log.Printf("%v: End meta", state)
@@ -249,29 +244,75 @@ func filterOne(c *Config, reader io.Reader, z *html.Tokenizer) error {
 				"Monday, January 2, 2006 at 3:04pm MST",
 				string(z.Text()))
 			if err != nil {
-				return err
+				return nil, err
 			}
-			messageDate = d
-			log.Printf("%v: Date: %v", state, messageDate)
+			m.Date = d
+
+			if m.Date.Before(t.Date) {
+				t.Date = m.Date
+			}
+			log.Printf("%v: Date: %v", state, m.Date)
 		}
 
 	case stateMessageP:
+		t := threads[len(threads)-1]
+		m := t.Messages[len(t.Messages)-1]
 		switch {
 		case tt == html.EndTagToken:
 			log.Printf("%v: End message P", state)
-			fmt.Printf("%v\t%v:\t%v\n", messageDate, messageFrom, messageP)
 			state = stateThread
 
 		default:
-			messageP = string(z.Text())
-			messageP = strings.Replace(messageP, "\r", " ", -1)
-			messageP = strings.Replace(messageP, "\n", " ", -1)
-			log.Printf("%v: MessageP %q", state, messageP)
+			m.P = string(z.Text())
+			m.P = strings.Replace(m.P, "\r", " ", -1)
+			m.P = strings.Replace(m.P, "\n", " ", -1)
+			log.Printf("%v: MessageP %q", state, m.P)
 		}
 
 	default:
-		return fmt.Errorf("%v: totally unexpected", state)
+		return nil, fmt.Errorf("%v: totally unexpected", state)
 	}
 
-	return nil
+	return threads, nil
+}
+
+func hasAttr(t html.Token, key, val string) bool {
+	if key == "" || val == "" {
+		return true
+	}
+	for _, a := range t.Attr {
+		if a.Key == key && a.Val == val {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Thread) Print(out io.Writer) {
+	if t == nil || len(t.Messages) == 0 {
+		return
+	}
+
+	fmt.Fprintf(out, "%v\t%v:\n", t.Date, t.Participants)
+	for i := len(t.Messages); i > 0; i-- {
+		m := t.Messages[i-1]
+		fmt.Fprintf(out, "%v\t%v:\t%v\n", m.Date, m.From, m.P)
+	}
+}
+
+type ThreadsByDate Threads
+
+func (ts ThreadsByDate) Len() int           { return len(ts) }
+func (ts ThreadsByDate) Swap(i, j int)      { ts[i], ts[j] = ts[j], ts[i] }
+func (ts ThreadsByDate) Less(i, j int) bool { return ts[i].Date.Before(ts[j].Date) }
+
+func (ts Threads) Print(out io.Writer) {
+	// sort the threads by time
+	tss := make([]*Thread, len(ts))
+	copy(tss, ts)
+	sort.Sort(ThreadsByDate(tss))
+
+	for _, t := range tss {
+		t.Print(out)
+	}
 }
